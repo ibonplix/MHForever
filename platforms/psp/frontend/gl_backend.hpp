@@ -44,14 +44,21 @@ struct LiveSettings {
     // the pack's folder (empty: none, or MHF_TEXTURE_PACK) and the release it is drawn for ("ULES01213").
     std::atomic<bool> texture_pack{true};
     std::string texture_pack_folder, texture_pack_game;
-    // Screen-space ambient occlusion (enhancement): on or off while the game runs, its strength (about 0 to 5) and its
+    // Screen-space ambient occlusion (enhancement): on or off while the game runs, its strength (about 0 to 10) and its
     // radius in PSP pixels. MHF_SSAO=1, MHF_SSAO_STRENGTH and MHF_SSAO_RADIUS set the values the game starts with.
     std::atomic<bool> ssao{false};
-    std::atomic<float> ssao_strength{5.0f};
-    std::atomic<float> ssao_radius{20.0f};
+    std::atomic<float> ssao_strength{10.0f};
+    std::atomic<float> ssao_radius{10.0f};
     // Beyond this distance from the camera (in the game's own units; 0 = no limit) the occlusion fades out, so far layers
     // such as the clouds are left alone.
     std::atomic<float> ssao_distance{45000.0f};
+    // Surfaces almost flat to each other do not occlude (bias, higher: fewer lines on flat walls), and how far in front of
+    // an occluder it still counts, as a fraction of its distance to the camera (range, lower: less reach).
+    std::atomic<float> ssao_bias{0.36f};
+    std::atomic<float> ssao_range{0.15f};
+    // Steps lower than this fraction of their distance to the camera do not occlude (thin ledges, ground tiles and decals
+    // lying a little above the terrain).
+    std::atomic<float> ssao_thin{0.025f};
 };
 
 // Creates the context on the calling thread. Returns nullptr (after logging why) when OpenGL 3.3 is unavailable.

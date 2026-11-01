@@ -343,10 +343,13 @@ float raw_depth(ivec2 ip) {
 }
 // Position in front of the camera (view space) of the pixel `ip`. Only its distances matter: the mirroring of y that
 // the GE's viewport may carry is undone by turning every normal towards the camera.
+float eye_z(float d) {
+    float zn = (d * 65535.0 - u_vz.y) / u_vz.x;
+    return (u_proj_z.x - zn * u_proj_z.y) / (zn * u_proj.w - u_proj.z);
+}
 vec3 view_pos(ivec2 ip) {
     float d = raw_depth(ip);
-    float zn = (d * 65535.0 - u_vz.y) / u_vz.x;
-    float ze = (u_proj_z.x - zn * u_proj_z.y) / (zn * u_proj.w - u_proj.z);
+    float ze = eye_z(d);
     float w = u_proj.w * ze + u_proj_z.y;
     vec2 ndc = (vec2(clamp(ip, ivec2(0), ivec2(u_size) - ivec2(1))) + 0.5) / u_size * 2.0 - 1.0;
     return vec3(ndc.x * w / u_proj.x, ndc.y * w / u_proj.y, ze);
@@ -360,8 +363,23 @@ uniform float u_strength;
 uniform float u_bias;      // surfaces almost flat to each other do not occlude
 uniform float u_range;     // how far in front of an occluder it still counts, as a fraction of the distance to the camera
 uniform float u_fade;      // the occlusion fades out up to this distance from the camera (0: no limit)
+uniform float u_thin;      // steps lower than this fraction of the distance to the camera do not occlude
+uniform float u_scale;     // the internal resolution multiplier: the normal is measured over 2 PSP pixels
 out vec4 o_color;
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+// The normal of the surface at pixel `q` (view-space position `pq`) from the depth around: the nearer neighbour on each
+// axis, so an edge does not bend it. Turned towards the camera; (0,0,0) when it cannot be told.
+vec3 normal_at(ivec2 q, vec3 pq, int ns) {
+    vec3 pr = view_pos(q + ivec2(ns, 0)), pl = view_pos(q - ivec2(ns, 0));
+    vec3 pu = view_pos(q + ivec2(0, ns)), pd = view_pos(q - ivec2(0, ns));
+    vec3 dx = abs(pr.z - pq.z) < abs(pq.z - pl.z) ? pr - pq : pq - pl;
+    vec3 dy = abs(pu.z - pq.z) < abs(pq.z - pd.z) ? pu - pq : pq - pd;
+    vec3 n = cross(dx, dy);
+    float nl = length(n);
+    if (nl < 1e-12) return vec3(0.0);
+    n /= nl;
+    return dot(n, pq) > 0.0 ? -n : n;
+}
 void main() {
     ivec2 ip = ivec2(gl_FragCoord.xy);
     if (raw_depth(ip) >= kSky) { o_color = vec4(1.0); return; }
@@ -369,16 +387,14 @@ void main() {
     float zl = abs(p.z);
     float fade = u_fade > 0.0 ? 1.0 - smoothstep(0.6 * u_fade, u_fade, zl) : 1.0;
     if (fade <= 0.0) { o_color = vec4(1.0); return; }
-    // The normal from the depth around: the nearer neighbour on each axis, so an edge does not bend it.
-    vec3 pr = view_pos(ip + ivec2(2, 0)), pl = view_pos(ip - ivec2(2, 0));
-    vec3 pu = view_pos(ip + ivec2(0, 2)), pd = view_pos(ip - ivec2(0, 2));
-    vec3 dx = abs(pr.z - p.z) < abs(p.z - pl.z) ? pr - p : p - pl;
-    vec3 dy = abs(pu.z - p.z) < abs(p.z - pd.z) ? pu - p : p - pd;
-    vec3 n = cross(dx, dy);
-    float nl = length(n);
-    if (nl < 1e-12) { o_color = vec4(1.0); return; }
-    n /= nl;
-    if (dot(n, p) > 0.0) n = -n;
+    int ns = max(2, int(u_scale * 2.0 + 0.5));
+    vec3 n = normal_at(ip, p, ns);
+    if (n == vec3(0.0)) { o_color = vec4(1.0); return; }
+    // The depth buffer has 24 bits: far away one step of it is a visible distance, which tilts the normal measured here
+    // and makes flat walls look creased. Heights above the surface smaller than that error (growing with the distance
+    // to the sample) are not occlusion.
+    float d0 = raw_depth(ip);
+    float quantum = 0.5 * abs(eye_z(d0 + 2.0 / 16777215.0) - eye_z(d0));
     float rot = ign(gl_FragCoord.xy) * 6.2831853;
     float occ = 0.0;
     const int N = 16;
@@ -390,9 +406,14 @@ void main() {
         vec3 v = view_pos(sp) - p;
         float dist = length(v);
         if (dist < 1e-9) continue;
-        float elevation = dot(v, n) / dist;
+        float height = dot(v, n) - 1.5 * quantum * (1.0 + length(vec2(sp - ip)) / float(ns)) - u_thin * zl;
+        float elevation = max(height, 0.0) / dist;
         float fall = clamp(1.0 - dist / (u_range * zl), 0.0, 1.0);
-        occ += max(elevation - u_bias, 0.0) * fall;
+        float o = max(elevation - u_bias, 0.0);
+        // A low step to a surface parallel to this one (water tiles, ground decals) is not a crease: it is skipped up to
+        // three times the thickness, while overhangs and real corners, higher or not parallel, still occlude.
+        if (o > 0.0 && height < 2.0 * u_thin * zl && dot(normal_at(sp, p + v, ns), n) > 0.97) o = 0.0;
+        occ += o * fall;
     }
     o_color = vec4(vec3(clamp(1.0 - fade * u_strength * occ / float(N), 0.0, 1.0)), 1.0);
 }
@@ -886,9 +907,8 @@ private:
     GLint blur_uv_off_{}, blur_uv_scale_{}, blur_tex_{}, blur_dir_{}, blur_dim_{};
     // Screen-space ambient occlusion (enhancement, off by default): on/off, strength and radius are in LiveSettings (the
     // menu changes them while the game runs; MHF_SSAO=1, MHF_SSAO_STRENGTH and MHF_SSAO_RADIUS give the starting values).
-    // MHF_SSAO_DEBUG=1 shows the occlusion alone, MHF_SSAO_BIAS and _RANGE tune it.
+    // MHF_SSAO_BIAS and _RANGE (LiveSettings too) tune it; MHF_SSAO_DEBUG=1 shows the occlusion alone.
     bool ao_ready_{}, ao_tried_{}, ao_debug_{};
-    float ao_bias_{0.15f}, ao_range_{0.12f};
     GLuint ao_program_{}, ao_blur_program_{}, ao_apply_program_{}, ao_texture_[2]{}, ao_fbo_[2]{};
     GLsizei ao_w_{}, ao_h_{};
     std::uint32_t ao_addr_{};                    // the target the 3D scene was drawn into
@@ -1154,8 +1174,9 @@ bool GlBackend::init() {
         if (const char *on = std::getenv("MHF_SSAO"); on != nullptr && on[0] != '0') live_->ssao = true;
         live_->ssao_radius = number("MHF_SSAO_RADIUS", live_->ssao_radius.load());
         live_->ssao_strength = number("MHF_SSAO_STRENGTH", live_->ssao_strength.load());
-        ao_bias_ = number("MHF_SSAO_BIAS", ao_bias_);
-        ao_range_ = number("MHF_SSAO_RANGE", ao_range_);
+        live_->ssao_bias = number("MHF_SSAO_BIAS", live_->ssao_bias.load());
+        live_->ssao_range = number("MHF_SSAO_RANGE", live_->ssao_range.load());
+        live_->ssao_thin = number("MHF_SSAO_THIN", live_->ssao_thin.load());
         ao_debug_ = std::getenv("MHF_SSAO_DEBUG") != nullptr;
     }
 
@@ -1735,7 +1756,7 @@ bool GlBackend::ssao_active() {
         ao_apply_program_ = compile(kAoVertex, kAoApplyFragment);
         ao_ready_ = ao_program_ != 0 && ao_blur_program_ != 0 && ao_apply_program_ != 0;
         std::fprintf(stderr, "[ssao] %s: radius %g, strength %g, bias %g, range %g%s\n", ao_ready_ ? "on" : "shader failed",
-                     live_->ssao_radius.load(), live_->ssao_strength.load(), ao_bias_, ao_range_,
+                     live_->ssao_radius.load(), live_->ssao_strength.load(), live_->ssao_bias.load(), live_->ssao_range.load(),
                      ao_debug_ ? ", showing the occlusion only" : "");
     }
     return ao_ready_;
@@ -1795,9 +1816,11 @@ void GlBackend::run_ssao(RenderTarget &rt) {
     const float radius = std::max(0.5f, live_->ssao_radius.load(std::memory_order_relaxed));
     gl_.Uniform1f(uniform(ao_program_, "u_radius"), radius * static_cast<float>(scale_));
     gl_.Uniform1f(uniform(ao_program_, "u_strength"), live_->ssao_strength.load(std::memory_order_relaxed));
-    gl_.Uniform1f(uniform(ao_program_, "u_bias"), ao_bias_);
-    gl_.Uniform1f(uniform(ao_program_, "u_range"), ao_range_);
+    gl_.Uniform1f(uniform(ao_program_, "u_bias"), live_->ssao_bias.load(std::memory_order_relaxed));
+    gl_.Uniform1f(uniform(ao_program_, "u_range"), std::max(0.01f, live_->ssao_range.load(std::memory_order_relaxed)));
     gl_.Uniform1f(uniform(ao_program_, "u_fade"), live_->ssao_distance.load(std::memory_order_relaxed));
+    gl_.Uniform1f(uniform(ao_program_, "u_scale"), static_cast<float>(scale_));
+    gl_.Uniform1f(uniform(ao_program_, "u_thin"), live_->ssao_thin.load(std::memory_order_relaxed));
     gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     // 2. Blurred along x into texture 1, then along y back into texture 0.

@@ -447,7 +447,7 @@ void update_dialogs(Frontend::Impl &impl, Runtime &rt) {
 
 enum MenuId {
     kResume = 1, kQuit, kQuitYes, kQuitNo, kMusic, kSfx, kScale, kFps, kFullscreen, kSmooth, kTexturePack, kPadStick, kRestoreKeys, kRestorePad,
-    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore, kSsao, kSsaoStrength, kSsaoRadius, kSsaoDistance
+    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore, kSsao, kSsaoStrength, kSsaoRadius, kSsaoDistance, kSsaoBias, kSsaoRange, kSsaoThin
 };
 constexpr int kFriendBase = 4000; // the Online tab's friend rows: kFriendBase + an index into Impl::friends
 
@@ -729,7 +729,7 @@ overlay::MenuView menu_main(const Frontend::Impl &impl) {
     ssao.detail = "Darkens corners and creases in the 3D scene. Off draws the game as it is.";
     video.items.push_back(ssao);
     if (impl.live.ssao) { // its settings unfold under the switch while it is on
-        video.items.push_back(menu_item(Kind::Slider, kSsaoStrength, "Occlusion strength", static_cast<int>(impl.live.ssao_strength * 20.0f + 0.5f)));
+        video.items.push_back(menu_item(Kind::Slider, kSsaoStrength, "Occlusion strength", static_cast<int>(impl.live.ssao_strength * 10.0f + 0.5f)));
         video.items.push_back(menu_item(Kind::Slider, kSsaoRadius, "Occlusion radius", static_cast<int>(impl.live.ssao_radius * 5.0f + 0.5f)));
         // Distance beyond which the occlusion fades out: 30 * 1.08^value, and the top of the slider is no limit.
         const float distance = impl.live.ssao_distance;
@@ -737,6 +737,15 @@ overlay::MenuView menu_main(const Frontend::Impl &impl) {
         overlay::MenuItem reach = menu_item(Kind::Slider, kSsaoDistance, "Occlusion distance", value);
         reach.detail = "Lower it until the clouds stop showing streaks. All the way up: no limit.";
         video.items.push_back(reach);
+        overlay::MenuItem bias = menu_item(Kind::Slider, kSsaoBias, "Occlusion flatness", static_cast<int>(impl.live.ssao_bias / 0.006f + 0.5f));
+        bias.detail = "Raise it if flat walls show lines: surfaces nearly flat to each other stop occluding.";
+        video.items.push_back(bias);
+        overlay::MenuItem range = menu_item(Kind::Slider, kSsaoRange, "Occlusion reach", static_cast<int>(impl.live.ssao_range / 0.005f + 0.5f));
+        range.detail = "Lower it if dark halos show around characters and edges.";
+        video.items.push_back(range);
+        overlay::MenuItem thin = menu_item(Kind::Slider, kSsaoThin, "Occlusion thickness", static_cast<int>(impl.live.ssao_thin / 0.0005f + 0.5f));
+        thin.detail = "Raise it if thin ledges, ground tiles and decals show dark edges: steps lower than this stop occluding.";
+        video.items.push_back(thin);
     }
     overlay::MenuTab controls{"Controls", {menu_item(Kind::Heading, 0, "Keyboard")}, "Click a key or a button, then press the new one."};
     for (std::size_t i = 0; i < host::kKeyActions.size(); ++i) {
@@ -1090,7 +1099,10 @@ bool menu_handle(Frontend::Impl &impl, Runtime &rt, const overlay::Menu::Event &
             impl.live.ssao = e.value != 0;
             refresh_menu(impl); // the sliders under it appear or go
             break;
-        case kSsaoStrength: impl.live.ssao_strength = static_cast<float>(std::clamp(e.value, 0, 100)) / 20.0f; break; // 0 to 5
+        case kSsaoStrength: impl.live.ssao_strength = static_cast<float>(std::clamp(e.value, 0, 100)) / 10.0f; break; // 0 to 10
+        case kSsaoBias: impl.live.ssao_bias = static_cast<float>(std::clamp(e.value, 0, 100)) * 0.006f; break;  // 0 to 0.6
+        case kSsaoThin: impl.live.ssao_thin = static_cast<float>(std::clamp(e.value, 0, 100)) * 0.0005f; break; // 0 to 0.05
+        case kSsaoRange: impl.live.ssao_range = static_cast<float>(std::clamp(e.value, 0, 100)) * 0.005f; break; // 0 to 0.5
         case kSsaoDistance:
             impl.live.ssao_distance = e.value >= 100 ? 0.0f : 30.0f * std::pow(1.08f, static_cast<float>(std::max(e.value, 0)));
             break;

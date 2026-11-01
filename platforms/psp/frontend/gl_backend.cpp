@@ -316,6 +316,115 @@ void main() {
 }
 )";
 
+// ---------------------------------------------------------------- screen-space ambient occlusion (MHF_SSAO=1)
+//
+// Run once per picture, between the 3D scene and the 2D drawing over it (the HUD): the occlusion is worked out from the
+// scene's depth texture, blurred without crossing edges, and multiplied into the colour. The depth is the GE's screen
+// depth (0..1 for z 0..65535); the projection and the viewport depth scale of the scene turn it back into the distance
+// in front of the camera, as the Ge computed it: z_screen = z_clip / w * scale + centre.
+
+constexpr const char *kAoVertex = R"(#version 330 core
+void main() {
+    vec2 p = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+constexpr const char *kAoCommon = R"(
+uniform sampler2D u_depth;
+uniform vec2 u_size;     // size of the render target in pixels
+uniform vec4 u_proj;     // projection matrix elements 0, 5, 10, 11
+uniform vec2 u_proj_z;   // elements 14, 15
+uniform vec2 u_vz;       // viewport depth scale and centre
+const float kSky = 0.99995;
+float raw_depth(ivec2 ip) {
+    ip = clamp(ip, ivec2(0), ivec2(u_size) - ivec2(1));
+    return texelFetch(u_depth, ip, 0).r;
+}
+// Position in front of the camera (view space) of the pixel `ip`. Only its distances matter: the mirroring of y that
+// the GE's viewport may carry is undone by turning every normal towards the camera.
+vec3 view_pos(ivec2 ip) {
+    float d = raw_depth(ip);
+    float zn = (d * 65535.0 - u_vz.y) / u_vz.x;
+    float ze = (u_proj_z.x - zn * u_proj_z.y) / (zn * u_proj.w - u_proj.z);
+    float w = u_proj.w * ze + u_proj_z.y;
+    vec2 ndc = (vec2(clamp(ip, ivec2(0), ivec2(u_size) - ivec2(1))) + 0.5) / u_size * 2.0 - 1.0;
+    return vec3(ndc.x * w / u_proj.x, ndc.y * w / u_proj.y, ze);
+}
+)";
+
+// The fragment shaders below are put after "#version 330 core" and kAoCommon when the programs are made.
+constexpr const char *kAoFragment = R"(
+uniform float u_radius;    // how far around a pixel to look, in pixels
+uniform float u_strength;
+uniform float u_bias;      // surfaces almost flat to each other do not occlude
+uniform float u_range;     // how far in front of an occluder it still counts, as a fraction of the distance to the camera
+uniform float u_fade;      // the occlusion fades out up to this distance from the camera (0: no limit)
+out vec4 o_color;
+float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+void main() {
+    ivec2 ip = ivec2(gl_FragCoord.xy);
+    if (raw_depth(ip) >= kSky) { o_color = vec4(1.0); return; }
+    vec3 p = view_pos(ip);
+    float zl = abs(p.z);
+    float fade = u_fade > 0.0 ? 1.0 - smoothstep(0.6 * u_fade, u_fade, zl) : 1.0;
+    if (fade <= 0.0) { o_color = vec4(1.0); return; }
+    // The normal from the depth around: the nearer neighbour on each axis, so an edge does not bend it.
+    vec3 pr = view_pos(ip + ivec2(2, 0)), pl = view_pos(ip - ivec2(2, 0));
+    vec3 pu = view_pos(ip + ivec2(0, 2)), pd = view_pos(ip - ivec2(0, 2));
+    vec3 dx = abs(pr.z - p.z) < abs(p.z - pl.z) ? pr - p : p - pl;
+    vec3 dy = abs(pu.z - p.z) < abs(p.z - pd.z) ? pu - p : p - pd;
+    vec3 n = cross(dx, dy);
+    float nl = length(n);
+    if (nl < 1e-12) { o_color = vec4(1.0); return; }
+    n /= nl;
+    if (dot(n, p) > 0.0) n = -n;
+    float rot = ign(gl_FragCoord.xy) * 6.2831853;
+    float occ = 0.0;
+    const int N = 16;
+    for (int i = 0; i < N; ++i) {
+        float a = rot + float(i) * 2.399963;
+        float r = u_radius * sqrt((float(i) + 0.5) / float(N));
+        ivec2 sp = ip + ivec2(round(vec2(cos(a), sin(a)) * r));
+        if (raw_depth(sp) >= kSky) continue;
+        vec3 v = view_pos(sp) - p;
+        float dist = length(v);
+        if (dist < 1e-9) continue;
+        float elevation = dot(v, n) / dist;
+        float fall = clamp(1.0 - dist / (u_range * zl), 0.0, 1.0);
+        occ += max(elevation - u_bias, 0.0) * fall;
+    }
+    o_color = vec4(vec3(clamp(1.0 - fade * u_strength * occ / float(N), 0.0, 1.0)), 1.0);
+}
+)";
+
+// One direction of the blur: taps weighted down with their distance and with their difference in depth.
+constexpr const char *kAoBlurFragment = R"(
+uniform sampler2D u_ao;
+uniform vec2 u_step;       // pixels between taps, with the direction
+out vec4 o_color;
+void main() {
+    ivec2 ip = ivec2(gl_FragCoord.xy);
+    if (raw_depth(ip) >= kSky) { o_color = vec4(1.0); return; }
+    float zc = abs(view_pos(ip).z);
+    float sum = 0.0, weights = 0.0;
+    for (int i = -4; i <= 4; ++i) {
+        ivec2 sp = clamp(ip + ivec2(round(u_step * float(i))), ivec2(0), ivec2(u_size) - ivec2(1));
+        if (raw_depth(sp) >= kSky) continue;
+        float w = (1.0 - abs(float(i)) / 5.0) * max(0.0, 1.0 - abs(abs(view_pos(sp).z) - zc) / (0.02 * zc));
+        sum += texelFetch(u_ao, sp, 0).r * w;
+        weights += w;
+    }
+    o_color = vec4(vec3(weights > 0.0 ? sum / weights : 1.0), 1.0);
+}
+)";
+
+constexpr const char *kAoApplyFragment = R"(#version 330 core
+uniform sampler2D u_ao;
+out vec4 o_color;
+void main() { o_color = vec4(vec3(texelFetch(u_ao, ivec2(gl_FragCoord.xy), 0).r), 1.0); }
+)";
+
 // ---------------------------------------------------------------- pixel helpers
 
 std::uint32_t expand(std::uint32_t v, int bits) {
@@ -720,6 +829,8 @@ private:
                      float t) const;
 
     void apply_state(const gpu::Ge &ge);
+    bool ssao_active(); // SSAO is on (LiveSettings::ssao) and its shaders compiled, which happens the first time it is on
+    void run_ssao(RenderTarget &rt);
     void emit_state(const DrawSetup &setup, RenderTarget &rt);
     void draw_vertices(const std::vector<GpuVertex> &vertices);
     void show(GLuint texture, float uv_max_x, float uv_max_y);
@@ -773,6 +884,16 @@ private:
     static constexpr GLsizei kBlurW = 320, kBlurH = 180;
     GLuint blur_program_{}, blur_texture_[2]{}, blur_fbo_[2]{};
     GLint blur_uv_off_{}, blur_uv_scale_{}, blur_tex_{}, blur_dir_{}, blur_dim_{};
+    // Screen-space ambient occlusion (enhancement, off by default): on/off, strength and radius are in LiveSettings (the
+    // menu changes them while the game runs; MHF_SSAO=1, MHF_SSAO_STRENGTH and MHF_SSAO_RADIUS give the starting values).
+    // MHF_SSAO_DEBUG=1 shows the occlusion alone, MHF_SSAO_BIAS and _RANGE tune it.
+    bool ao_ready_{}, ao_tried_{}, ao_debug_{};
+    float ao_bias_{0.15f}, ao_range_{0.12f};
+    GLuint ao_program_{}, ao_blur_program_{}, ao_apply_program_{}, ao_texture_[2]{}, ao_fbo_[2]{};
+    GLsizei ao_w_{}, ao_h_{};
+    std::uint32_t ao_addr_{};                    // the target the 3D scene was drawn into
+    std::uint64_t ao_scene_frame_{}, ao_done_frame_{};
+    float ao_proj_[6]{}, ao_vz_[2]{};            // the scene's projection (elements 0, 5, 10, 11, 14, 15), viewport depth scale and centre
     GLuint blur_source_{}; // the picture the blur was made from
     bool blur_ready_ = false;
     bool redraw_only_ = false; // show() draws the same picture again (tick with nothing new): the blur can be kept
@@ -937,6 +1058,10 @@ private:
         int before_slot{};
         GLuint final_texture{};
         float uv_max[2]{1, 1};
+        // Ambient occlusion: this flip's picture had it, and the scene's projection and viewport depth as it was drawn,
+        // for the in-between pictures to work it out again (the live values may already be the next flip's).
+        bool ao{};
+        float ao_proj[6]{}, ao_vz[2]{};
     } flip_;
     // The flip being shown, in time: in-between pictures go out as often as the drawing thread can, at most one per
     // step (the chosen rate), each one placed where things are at the moment it is drawn; there is no fixed slot a
@@ -1020,6 +1145,19 @@ bool GlBackend::init() {
     u_.tex = uniform(draw_program_, "u_tex");
     present_uv_max_ = uniform(present_program_, "u_uv_max");
     present_tex_ = uniform(present_program_, "u_tex");
+    {
+        // The starting values of the ambient occlusion; the shaders are compiled the first time it is switched on.
+        const auto number = [](const char *name, float fallback) {
+            const char *s = std::getenv(name);
+            return s != nullptr ? static_cast<float>(std::atof(s)) : fallback;
+        };
+        if (const char *on = std::getenv("MHF_SSAO"); on != nullptr && on[0] != '0') live_->ssao = true;
+        live_->ssao_radius = number("MHF_SSAO_RADIUS", live_->ssao_radius.load());
+        live_->ssao_strength = number("MHF_SSAO_STRENGTH", live_->ssao_strength.load());
+        ao_bias_ = number("MHF_SSAO_BIAS", ao_bias_);
+        ao_range_ = number("MHF_SSAO_RANGE", ao_range_);
+        ao_debug_ = std::getenv("MHF_SSAO_DEBUG") != nullptr;
+    }
 
     gl_.GenVertexArrays(1, &vao_);
     gl_.GenVertexArrays(1, &empty_vao_);
@@ -1102,13 +1240,15 @@ void GlBackend::allocate(RenderTarget &rt, std::uint32_t height) {
     gl_.BindTexture(GL_TEXTURE_2D, color);
     gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     set_texture_params(true, true, true);
-    gl_.GenRenderbuffers(1, &depth);
-    gl_.BindRenderbuffer(GL_RENDERBUFFER, depth);
-    gl_.RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    // The depth is a texture (not a renderbuffer) so that effects can read it.
+    gl_.GenTextures(1, &depth);
+    gl_.BindTexture(GL_TEXTURE_2D, depth);
+    gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, w, h, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+    set_texture_params(false, true, true);
     gl_.GenFramebuffers(1, &fbo);
     gl_.BindFramebuffer(GL_FRAMEBUFFER, fbo);
     gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
-    gl_.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
     gl_.Disable(GL_SCISSOR_TEST);
     gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl_.DepthMask(GL_TRUE);
@@ -1122,7 +1262,7 @@ void GlBackend::allocate(RenderTarget &rt, std::uint32_t height) {
         gl_.BlitFramebuffer(0, 0, w, old_h, 0, 0, w, old_h, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
         gl_.DeleteFramebuffers(1, &rt.fbo);
         gl_.DeleteTextures(1, &rt.color);
-        gl_.DeleteRenderbuffers(1, &rt.depth);
+        gl_.DeleteTextures(1, &rt.depth);
     }
     rt.fbo = fbo;
     rt.color = color;
@@ -1139,7 +1279,7 @@ GlBackend::RenderTarget &GlBackend::target_for(std::uint32_t address, std::uint3
         auto &old = it->second;
         gl_.DeleteFramebuffers(1, &old.fbo);
         gl_.DeleteTextures(1, &old.color);
-        gl_.DeleteRenderbuffers(1, &old.depth);
+        gl_.DeleteTextures(1, &old.depth);
         targets_.erase(it);
         it = targets_.end();
     }
@@ -1160,7 +1300,7 @@ GlBackend::RenderTarget &GlBackend::target_for(std::uint32_t address, std::uint3
             if (victim == targets_.end()) break;
             gl_.DeleteFramebuffers(1, &victim->second.fbo);
             gl_.DeleteTextures(1, &victim->second.color);
-            gl_.DeleteRenderbuffers(1, &victim->second.depth);
+            gl_.DeleteTextures(1, &victim->second.depth);
             targets_.erase(victim);
         }
     } else if (needed_height > it->second.height) {
@@ -1545,6 +1685,26 @@ void GlBackend::apply_state(const gpu::Ge &ge) {
     setup.through = through_;
     setup.target = rt.address;
 
+    // Ambient occlusion: the opaque 3D drawn into the screen's target is the scene; when 2D drawing starts over it (the
+    // HUD), the occlusion is worked out and multiplied into what was drawn so far. Once per picture.
+    if (ssao_active() && (ge.reg(kClearMode) & 1u) == 0 && rt.width >= 480u && rt.width <= 512u && rt.height >= 272u &&
+        rt.height <= 274u) {
+        if (!through_) {
+            if ((ge.reg(kZTestEnable) & 1u) != 0 && (ge.reg(kZWriteDisable) & 1u) == 0) {
+                const auto &p = ge.proj_matrix().m;
+                ao_proj_[0] = p[0], ao_proj_[1] = p[5], ao_proj_[2] = p[10], ao_proj_[3] = p[11], ao_proj_[4] = p[14],
+                ao_proj_[5] = p[15];
+                ao_vz_[0] = gpu::float24(ge.reg(kViewportZScale));
+                ao_vz_[1] = gpu::float24(ge.reg(kViewportZCenter));
+                ao_addr_ = rt.address;
+                ao_scene_frame_ = frame_;
+            }
+        } else if (ao_scene_frame_ == frame_ && ao_done_frame_ != frame_ && ao_addr_ == rt.address) {
+            ao_done_frame_ = frame_;
+            run_ssao(rt);
+        }
+    }
+
     // Texture (may blit, so before the target is bound).
     const bool clear = (ge.reg(kClearMode) & 1u) != 0;
     const bool textured = !clear && (ge.reg(kTextureMapEnable) & 1u) != 0;
@@ -1563,6 +1723,118 @@ void GlBackend::apply_state(const gpu::Ge &ge) {
     setup.tex_height = tex_height_;
     setup_ = setup;
     emit_state(setup, rt);
+}
+
+bool GlBackend::ssao_active() {
+    if (!live_->ssao.load(std::memory_order_relaxed)) return false;
+    if (!ao_tried_) {
+        ao_tried_ = true;
+        const std::string head = std::string("#version 330 core\n") + kAoCommon;
+        ao_program_ = compile(kAoVertex, (head + kAoFragment).c_str());
+        ao_blur_program_ = compile(kAoVertex, (head + kAoBlurFragment).c_str());
+        ao_apply_program_ = compile(kAoVertex, kAoApplyFragment);
+        ao_ready_ = ao_program_ != 0 && ao_blur_program_ != 0 && ao_apply_program_ != 0;
+        std::fprintf(stderr, "[ssao] %s: radius %g, strength %g, bias %g, range %g%s\n", ao_ready_ ? "on" : "shader failed",
+                     live_->ssao_radius.load(), live_->ssao_strength.load(), ao_bias_, ao_range_,
+                     ao_debug_ ? ", showing the occlusion only" : "");
+    }
+    return ao_ready_;
+}
+
+void GlBackend::run_ssao(RenderTarget &rt) {
+    if (ao_vz_[0] == 0.0f) return;
+    const GLsizei w = static_cast<GLsizei>(rt.width) * scale_, h = static_cast<GLsizei>(rt.height) * scale_;
+    static int runs = 0;
+    if (runs < 3 || runs % 300 == 0) {
+        std::fprintf(stderr, "[ssao] picture %d: projection %g %g %g %g %g %g, depth scale %g centre %g, target %dx%d\n", runs,
+                     ao_proj_[0], ao_proj_[1], ao_proj_[2], ao_proj_[3], ao_proj_[4], ao_proj_[5], ao_vz_[0], ao_vz_[1], w, h);
+    }
+    ++runs;
+
+    gl_.ActiveTexture(GL_TEXTURE0);
+    if (ao_w_ != w || ao_h_ != h) {
+        for (int i = 0; i < 2; ++i) {
+            if (ao_fbo_[i] != 0) {
+                gl_.DeleteFramebuffers(1, &ao_fbo_[i]);
+                gl_.DeleteTextures(1, &ao_texture_[i]);
+            }
+            gl_.GenTextures(1, &ao_texture_[i]);
+            gl_.BindTexture(GL_TEXTURE_2D, ao_texture_[i]);
+            gl_.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            set_texture_params(false, true, true);
+            gl_.GenFramebuffers(1, &ao_fbo_[i]);
+            gl_.BindFramebuffer(GL_FRAMEBUFFER, ao_fbo_[i]);
+            gl_.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ao_texture_[i], 0);
+        }
+        ao_w_ = w;
+        ao_h_ = h;
+    }
+
+    gl_.Disable(GL_SCISSOR_TEST);
+    gl_.Disable(GL_DEPTH_TEST);
+    gl_.DepthMask(GL_FALSE);
+    gl_.Disable(GL_BLEND);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BindVertexArray(empty_vao_);
+    gl_.Viewport(0, 0, w, h);
+    gl_.ActiveTexture(GL_TEXTURE1);
+    gl_.BindTexture(GL_TEXTURE_2D, rt.depth);
+
+    const auto scene = [&](GLuint program) {
+        gl_.UseProgram(program);
+        gl_.Uniform1i(uniform(program, "u_depth"), 1);
+        gl_.Uniform2f(uniform(program, "u_size"), static_cast<float>(w), static_cast<float>(h));
+        gl_.Uniform4f(uniform(program, "u_proj"), ao_proj_[0], ao_proj_[1], ao_proj_[2], ao_proj_[3]);
+        gl_.Uniform2f(uniform(program, "u_proj_z"), ao_proj_[4], ao_proj_[5]);
+        gl_.Uniform2f(uniform(program, "u_vz"), ao_vz_[0], ao_vz_[1]);
+    };
+
+    // 1. The occlusion, into texture 0.
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, ao_fbo_[0]);
+    scene(ao_program_);
+    const float radius = std::max(0.5f, live_->ssao_radius.load(std::memory_order_relaxed));
+    gl_.Uniform1f(uniform(ao_program_, "u_radius"), radius * static_cast<float>(scale_));
+    gl_.Uniform1f(uniform(ao_program_, "u_strength"), live_->ssao_strength.load(std::memory_order_relaxed));
+    gl_.Uniform1f(uniform(ao_program_, "u_bias"), ao_bias_);
+    gl_.Uniform1f(uniform(ao_program_, "u_range"), ao_range_);
+    gl_.Uniform1f(uniform(ao_program_, "u_fade"), live_->ssao_distance.load(std::memory_order_relaxed));
+    gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    // 2. Blurred along x into texture 1, then along y back into texture 0.
+    const float step = std::max(1.0f, static_cast<float>(scale_) * 0.5f);
+    for (int pass = 0; pass < 2; ++pass) {
+        gl_.BindFramebuffer(GL_FRAMEBUFFER, ao_fbo_[1 - pass]);
+        scene(ao_blur_program_);
+        gl_.Uniform1i(uniform(ao_blur_program_, "u_ao"), 2);
+        gl_.Uniform2f(uniform(ao_blur_program_, "u_step"), pass == 0 ? step : 0.0f, pass == 0 ? 0.0f : step);
+        gl_.ActiveTexture(GL_TEXTURE2);
+        gl_.BindTexture(GL_TEXTURE_2D, ao_texture_[pass]);
+        gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        gl_.ActiveTexture(GL_TEXTURE1);
+    }
+
+    // 3. Multiplied into the picture (or, when debugging, written over it). The depth texture is not read here: it is
+    // attached to the target being drawn into.
+    gl_.BindTexture(GL_TEXTURE_2D, 0);
+    gl_.BindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
+    gl_.UseProgram(ao_apply_program_);
+    gl_.Uniform1i(uniform(ao_apply_program_, "u_ao"), 2);
+    gl_.ActiveTexture(GL_TEXTURE2);
+    gl_.BindTexture(GL_TEXTURE_2D, ao_texture_[0]);
+    if (ao_debug_) {
+        gl_.Disable(GL_BLEND);
+    } else {
+        gl_.Enable(GL_BLEND);
+        gl_.BlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        gl_.BlendFuncSeparate(GL_ZERO, GL_SRC_COLOR, GL_ZERO, GL_ONE);
+    }
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+    gl_.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    gl_.Disable(GL_BLEND);
+    gl_.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl_.BindTexture(GL_TEXTURE_2D, 0);
+    gl_.ActiveTexture(GL_TEXTURE0);
 }
 
 void GlBackend::emit_state(const DrawSetup &setup, RenderTarget &rt) {
@@ -2614,7 +2886,7 @@ void GlBackend::render_between(const RenderTarget &shown, const std::vector<Tape
         if (scratch_.fbo != 0) {
             gl_.DeleteFramebuffers(1, &scratch_.fbo);
             gl_.DeleteTextures(1, &scratch_.color);
-            gl_.DeleteRenderbuffers(1, &scratch_.depth);
+            gl_.DeleteTextures(1, &scratch_.depth);
         }
         scratch_ = RenderTarget{};
         scratch_.address = shown.address;
@@ -2740,8 +3012,28 @@ void GlBackend::render_between(const RenderTarget &shown, const std::vector<Tape
                    GL_STREAM_DRAW);
     cost_.calc_us += us(t_calc, t_upload);
     cost_.upload_us += us(t_upload, Clock::now());
+    // Ambient occlusion, as in the flip's own picture: once, after the 3D scene and before the 2D drawing over it.
+    bool ao_pending = flip_.ao && ssao_active(), scene_drawn = false;
     for (std::size_t i = 0; i < now.size(); ++i) {
         if (ranges_[i].count == 0) continue;
+        if (ao_pending && (key_reg(now[i].setup.key, kClearMode) & 1u) == 0) {
+            if (!now[i].setup.through) {
+                if ((key_reg(now[i].setup.key, kZTestEnable) & 1u) != 0 && (key_reg(now[i].setup.key, kZWriteDisable) & 1u) == 0) {
+                    scene_drawn = true;
+                }
+            } else if (scene_drawn) {
+                ao_pending = false;
+                float proj[6], vz[2]; // the live values belong to whatever the game draws now: put them back after
+                std::copy(std::begin(ao_proj_), std::end(ao_proj_), std::begin(proj));
+                std::copy(std::begin(ao_vz_), std::end(ao_vz_), std::begin(vz));
+                std::copy(std::begin(flip_.ao_proj), std::end(flip_.ao_proj), std::begin(ao_proj_));
+                std::copy(std::begin(flip_.ao_vz), std::end(flip_.ao_vz), std::begin(ao_vz_));
+                run_ssao(scratch_);
+                std::copy(std::begin(proj), std::end(proj), std::begin(ao_proj_));
+                std::copy(std::begin(vz), std::end(vz), std::begin(ao_vz_));
+                have_state_ = false;
+            }
+        }
         const auto t_state = Clock::now();
         emit_state(now[i].setup, scratch_);
         const auto t_draw = Clock::now();
@@ -3002,6 +3294,9 @@ bool GlBackend::present_interpolated(RenderTarget &shown, const float uv_max[2])
         flip_.final_texture = slots_[fill_slot_].texture;
         flip_.uv_max[0] = uv_max[0];
         flip_.uv_max[1] = uv_max[1];
+        flip_.ao = ssao_active() && ao_done_frame_ == frame_ && ao_addr_ == shown.address;
+        std::copy(std::begin(ao_proj_), std::end(ao_proj_), std::begin(flip_.ao_proj));
+        std::copy(std::begin(ao_vz_), std::end(ao_vz_), std::begin(flip_.ao_vz));
         pacing_.active = true;
         pacing_.start = now;
         pacing_.interval = interval;
@@ -3155,7 +3450,7 @@ void GlBackend::apply_live_scale() {
         gl_.BlitFramebuffer(0, 0, old_w, old_h, 0, 0, new_w, new_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         gl_.DeleteFramebuffers(1, &old_fbo);
         gl_.DeleteTextures(1, &old_color);
-        gl_.DeleteRenderbuffers(1, &old_depth);
+        gl_.DeleteTextures(1, &old_depth);
     }
     scale_ = wanted;
     for (Slot &slot : slots_) {
@@ -3168,7 +3463,7 @@ void GlBackend::apply_live_scale() {
     if (scratch_.fbo != 0) {
         gl_.DeleteFramebuffers(1, &scratch_.fbo);
         gl_.DeleteTextures(1, &scratch_.color);
-        gl_.DeleteRenderbuffers(1, &scratch_.depth);
+        gl_.DeleteTextures(1, &scratch_.depth);
     }
     scratch_ = RenderTarget{};
     previous_valid_ = false;

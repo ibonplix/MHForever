@@ -447,7 +447,7 @@ void update_dialogs(Frontend::Impl &impl, Runtime &rt) {
 
 enum MenuId {
     kResume = 1, kQuit, kQuitYes, kQuitNo, kMusic, kSfx, kScale, kFps, kFullscreen, kSmooth, kTexturePack, kPadStick, kRestoreKeys, kRestorePad,
-    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore
+    kHalls, kRoomCode, kJoinRoom, kServer, kFriendsMore, kSsao, kSsaoStrength, kSsaoRadius, kSsaoDistance
 };
 constexpr int kFriendBase = 4000; // the Online tab's friend rows: kFriendBase + an index into Impl::friends
 
@@ -724,6 +724,19 @@ overlay::MenuView menu_main(const Frontend::Impl &impl) {
         overlay::MenuItem pack = menu_item(Kind::Toggle, kTexturePack, "Texture pack", impl.live.texture_pack ? 1 : 0);
         pack.detail = "Off draws the game's own textures again.";
         video.items.push_back(pack);
+    }
+    overlay::MenuItem ssao = menu_item(Kind::Toggle, kSsao, "Ambient occlusion", impl.live.ssao ? 1 : 0);
+    ssao.detail = "Darkens corners and creases in the 3D scene. Off draws the game as it is.";
+    video.items.push_back(ssao);
+    if (impl.live.ssao) { // its settings unfold under the switch while it is on
+        video.items.push_back(menu_item(Kind::Slider, kSsaoStrength, "Occlusion strength", static_cast<int>(impl.live.ssao_strength * 20.0f + 0.5f)));
+        video.items.push_back(menu_item(Kind::Slider, kSsaoRadius, "Occlusion radius", static_cast<int>(impl.live.ssao_radius * 5.0f + 0.5f)));
+        // Distance beyond which the occlusion fades out: 30 * 1.08^value, and the top of the slider is no limit.
+        const float distance = impl.live.ssao_distance;
+        const int value = distance <= 0.0f ? 100 : std::clamp(static_cast<int>(std::log(distance / 30.0f) / std::log(1.08f) + 0.5f), 0, 99);
+        overlay::MenuItem reach = menu_item(Kind::Slider, kSsaoDistance, "Occlusion distance", value);
+        reach.detail = "Lower it until the clouds stop showing streaks. All the way up: no limit.";
+        video.items.push_back(reach);
     }
     overlay::MenuTab controls{"Controls", {menu_item(Kind::Heading, 0, "Keyboard")}, "Click a key or a button, then press the new one."};
     for (std::size_t i = 0; i < host::kKeyActions.size(); ++i) {
@@ -1073,6 +1086,15 @@ bool menu_handle(Frontend::Impl &impl, Runtime &rt, const overlay::Menu::Event &
         case kFullscreen: impl.host.toggle_fullscreen(); break;
         case kSmooth: impl.live.smooth_textures = e.value != 0; break;
         case kTexturePack: impl.live.texture_pack = e.value != 0; break;
+        case kSsao:
+            impl.live.ssao = e.value != 0;
+            refresh_menu(impl); // the sliders under it appear or go
+            break;
+        case kSsaoStrength: impl.live.ssao_strength = static_cast<float>(std::clamp(e.value, 0, 100)) / 20.0f; break; // 0 to 5
+        case kSsaoDistance:
+            impl.live.ssao_distance = e.value >= 100 ? 0.0f : 30.0f * std::pow(1.08f, static_cast<float>(std::max(e.value, 0)));
+            break;
+        case kSsaoRadius: impl.live.ssao_radius = static_cast<float>(std::clamp(e.value, 0, 100)) / 5.0f; break;      // 0 to 20 pixels
         case kScale:
             impl.render_scale = e.value + 1;
             impl.live.scale = impl.render_scale; // the drawing thread applies it at the next picture
